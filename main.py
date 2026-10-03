@@ -1,6 +1,7 @@
 # Kerakli kutubxonalarni import qilish
 import asyncio
 import os
+from aiohttp import web
 import time
 import re
 import sqlite3
@@ -35,12 +36,24 @@ except ImportError:
 from html import escape
 # Rasmga ishlov berish uchun
 from PIL import Image, ImageOps
-try:
-    from rembg import remove as remove_bg  # type: ignore[import]
-    REMBG_AVAILABLE = True
-except ImportError:
-    remove_bg = None  # type: ignore[assignment]
-    REMBG_AVAILABLE = False
+# rembg/onnxruntime og'ir kutubxonalarini startupda yuklamaymiz.
+# Render 512 MB RAM xizmatida ular bot startida ortiqcha xotira egallashi mumkin.
+REMBG_AVAILABLE = None
+remove_bg = None
+
+def _get_remove_bg():
+    global REMBG_AVAILABLE, remove_bg
+    if REMBG_AVAILABLE is False:
+        return None
+    if remove_bg is None:
+        try:
+            from rembg import remove as _remove_bg  # type: ignore
+            remove_bg = _remove_bg
+            REMBG_AVAILABLE = True
+        except ImportError:
+            REMBG_AVAILABLE = False
+            return None
+    return remove_bg
 try:
     from pyrogram import Client  # type: ignore[import]
     from pyrogram.errors import SessionRevoked, AuthKeyUnregistered, UserDeactivated  # type: ignore[import]
@@ -49,10 +62,10 @@ except ImportError:
     Client = None  # type: ignore[assignment]
     SessionRevoked = AuthKeyUnregistered = UserDeactivated = Exception
     PYROGRAM_AVAILABLE = False
-from typing import Any, Awaitable, Callable, Dict, Union, List, Tuple, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Union, List, Tuple, Optional
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
@@ -63,6 +76,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     ContentType,
     KeyboardButton,
+    KeyboardButtonRequestChat,
     InlineKeyboardButton)
 from aiogram.types import FSInputFile
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
@@ -73,7 +87,12 @@ from database import Database
 # ============================================================
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler()],
+    force=True,
+)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("yt_dlp").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
@@ -106,10 +125,19 @@ CHANNEL_LINKS: list[str] = (
 )
 UPLOAD_CHANNEL_ID = os.getenv("UPLOAD_CHANNEL_ID") # Katta videolarni yuklash uchun kanal IDsi
 
-# Pyrogram (Userbot) sozlamalari - Katta fayllar (50MB+) uchun
+# Pyrogram — katta fayllar uchun Telegram upload yordamchisi
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 user_bot: Any = None
+
+# Telegram native chat-picker request IDs. Bu userbot dialoglarini ko'rsatmaydi:
+# foydalanuvchi Telegramning o'z oynasidan aniq chatni tanlaydi.
+ID_PICK_GROUP_REQUEST = 7101
+ID_PICK_CHANNEL_REQUEST = 7102
+
+# Support xabarlari uchun admin chatidagi message_id -> user_id xaritasi.
+# Reply orqali yo'naltirishni aniq va xavfsiz qiladi.
+SUPPORT_ADMIN_MESSAGE_MAP: Dict[Tuple[int, int], int] = {}
 # Userbot session faylini tozalash (agar SESSION_REVOKED xatosi bo'lsa)
 userbot_session_path = os.path.join(BASE_DIR, "my_account.session")
 userbot_session_journal_path = os.path.join(BASE_DIR, "my_account.session-journal")
@@ -190,7 +218,7 @@ def apply_youtube_auth(ydl_options, auth_source):
 # YouTube uchun barqaror clientlar.
 # "tv_downgraded" va ayrim cookie/client kombinatsiyalari 2026-yilda
 # "The page needs to be reloaded" xatosini keltirishi mumkin.
-YOUTUBE_PLAYER_CLIENTS = ["default"]
+YOUTUBE_PLAYER_CLIENTS = ["web_embedded", "default"]
 
 
 def get_youtube_ydl_opts(fmt: str, outtmpl: str, progress_hook=None, extra: dict = None) -> dict:
@@ -318,6 +346,7 @@ class UserStates(StatesGroup):
     edit_video_caption = State()
     my_images = State()
     edit_image_caption = State()
+    id_lookup = State()  # Kanal/guruh/foydalanuvchi ID aniqlash
 
 class TranslationStates(StatesGroup):
     select_source_lang = State()
@@ -325,6 +354,7 @@ class TranslationStates(StatesGroup):
     select_target_lang = State()
 
 class AdminStates(StatesGroup):
+    support_chat = State()
     broadcast = State()
     user_selection = State()
     search_user_id = State()
@@ -393,7 +423,6 @@ TRANSLATIONS = {
         "profile_header_admin": "<b>📋 Foydalanuvchi profil ma'lumotlari:</b>",
         "profile_status_excellent": "✅ {name}, sizning profilingiz to'liq va a'lo darajada! Sizga 5 ball!",
         "profile_status_good": "👍 {name}, profilingiz deyarli to'liq. Sizga 4 ball.",
-        "welcome_main": "Bosh menyuga xush kelibsiz! 🌟",
         "profile_status_satisfactory": "😐 {name}, profilingiz qoniqarli. Sizga 3 ball. Tuman yoki mahalla kabi ma'lumotlarni to'ldirishni tavsiya qilamiz.",
         "profile_status_poor": "😕 {name}, profilingizda ma'lumotlar kam. Sizga 2 ball. Iltimos, profilingizni to'ldiring.",
         "profile_status_very_poor": "👎 {name}, profilingiz bo'sh. Sizga 1 ball. Iltimos, 'Tahrirlash' tugmasi orqali ma'lumotlarni kiriting.",
@@ -535,7 +564,7 @@ TRANSLATIONS = {
         "btn_create_profile": "➕ Profil yaratish",
         "btn_restore_profile": "🔄 Profilni tiklash",
         "privacy_notice": "🔒 <b>Hurmatli foydalanuvchi!</b>\n\nSizning profil ma'lumotlaringiz begonalarga ko'rsatilmaydi. Maxfiylik va xavfsizlik to'liq ta'minlanadi. ✅",
-        "about_text": "🤖 <b>Dono Bot — Sizning universal yordamchingiz!</b>\n\nBu bot kundalik yumushlaringizni osonlashtirish uchun mo'ljallangan:\n\n📥 <b>Media yuklovchi:</b> YouTube, Instagram va Facebook'dan videolarni yuklab oling.\n🎵 <b>Musiqa olami:</b> Musiqa qidiring, videodan audio ajrating va Shazam orqali aniqlang.\n🗣 <b>Ovozli xizmatlar:</b> Matnni ovozga va ovozli xabarni matnga aylantiring.\n🖼 <b>Rasm tahrirlovchi:</b> Fonni olib tashlang va filtrlar qo'llang.\n🔄 <b>Professional tarjimon:</b> O'zbek, Rus va Ingliz tillari o'rtasida tarjima qiling.\n📢 <b>Reklama xizmati:</b> Mahsulotingizni bot orqali taniting.\n🆘 <b>Jonli muloqot:</b> Muammolar bo'yicha adminlar bilan bog'laning.\n\n🔒 <b>Xavfsizlik:</b> Ma'lumotlaringiz maxfiy saqlanadi.",
+        "about_text": "🤖 <b>Dono Bot — universal yordamchingiz!</b>\n\n📥 <b>Media:</b> YouTube, Instagram va Facebook'dan media yuklash.\n🎵 <b>Musiqa:</b> Musiqa qidirish, videodan audio ajratish va Shazam orqali aniqlash.\n🗣 <b>Ovoz:</b> Matn → ovoz va ovozli xabar → matn.\n🖼 <b>Rasm:</b> Fonni olib tashlash va oq-qora filtr.\n📢 <b>Reklama:</b> Reklama buyurtmasini yuborish va boshqarish.\n💾 <b>Saqlanganlar:</b> Mening musiqalarim, videolarim va rasmlarim.\n🆘 <b>Qo'llab-quvvatlash:</b> Admin bilan jonli chat, yakunda baho va fikr qoldirish.\n🔄 <b>Tarjima:</b> O'zbek, rus va ingliz tillari o'rtasida tarjima.\n🆔 <b>ID aniqlash:</b> Telegramning o'z chat tanlash oynasidan kanal yoki guruhni xavfsiz tanlash.\n\n🔐 <b>Maxfiylik:</b> Profil ma'lumotlari faqat reklama xizmati bilan bog'liq xizmatlarni ko'rsatish uchun ishlatiladi.\n🛡 <b>Xavfsizlik:</b> Bot faqat kerakli xizmatlarni bajarish uchun ma'lumotlardan foydalanadi; maxfiy kodlar, parollar va Telegram sessiyasi foydalanuvchidan so'ralmaydi.\n\n⚠️ <b>Eslatma:</b> Tashqi platformalarning (YouTube, Instagram va boshqalar) o'z cheklovlari bo'lishi mumkin.",
         "error": "⚠️ Xatolik yuz berdi.",
         "msg_wait_admin": "Xabaringiz adminga yuborildi, javobni kuting. ⏳",
         "rate_bot": "Iltimos, botni baholang (1-5): ⭐",
@@ -571,13 +600,19 @@ TRANSLATIONS = {
         "fmt_video": "🎬 Video (MP4)",
         "my_videos": "📹 Videolarim",
         "my_images": "🖼 Rasmlarim",
+        "id_lookup": "🆔 Kanal/Guruh ID",
+        "id_lookup_select": "📂 Telegramdan tanlash",
+        "id_lookup_manual": "✏️ Havola/@username bilan",
+        "id_lookup_choose": "📂 <b>Telegram kanal yoki guruh ID sini aniqlash</b>\n\n✏️ @username yoki t.me havolasini yuboring.\n📨 Yoki kanal/guruhdan xabarni Forward qiling.",
+        "id_lookup_prompt": "🆔 <b>ID aniqlash</b>\n\nInline tugmalardan birini tanlang: havola/@username yoki Forward qilingan xabar orqali ID ni aniqlayman.",
+        "id_lookup_result": "🆔 <b>ID aniqlandi</b>\n\n📌 Turi: <b>{kind}</b>\n👤 Nomi: <b>{name}</b>\n🔢 ID: <code>{chat_id}</code>",
+        "id_lookup_invalid": "⚠️ ID aniqlanmadi. Public kanal/guruh havolasini, @username ni yuboring yoki foydalanuvchining kontaktini/xabarini forward qiling.",
+        "id_lookup_private_invite": "⚠️ Private invite (+...) orqali Bot API ID ni aniqlay olmaydi. Kanal/guruhdan xabarni forward qiling yoki t.me/c/... havolasini yuboring.",
         "search_btn": "🔍 Qidirish",
         "page_label": "📄 Sahifa",
         "profile_updated": "Profil muvaffaqiyatli yangilandi! ✅",
         "btn_end_chat": "❌ Chatni yakunlash",
         "confirm_delete_profile": "Haqiqatdan ham profilni o'chirmoqchimisiz? ⚠️",
-        "yes": "✅ Ha",
-        "no": "❌ Yo'q",
         "profile_deleted": "Profil o'chirildi! 🗑️",
         "action_cancelled": "Bekor qilindi! ❌",
         "cancelled_text": "Bekor qilindi. ❌",
@@ -682,6 +717,14 @@ TRANSLATIONS = {
         "shazam_btn": "🎵 Shazam (Найти музыку)",
         "my_videos": "📹 Мои видео",
         "my_images": "🖼 Мои картинки",
+        "id_lookup": "🆔 ID канала/группы",
+        "id_lookup_select": "📂 Выбрать из Telegram",
+        "id_lookup_manual": "✏️ По ссылке/@username",
+        "id_lookup_choose": "📂 <b>Определение ID канала или группы Telegram</b>\n\n✏️ Отправьте @username или ссылку t.me.\n📨 Или перешлите сообщение из канала/группы.",
+        "id_lookup_prompt": "🆔 <b>Определение ID</b>\n\nВыберите способ: ссылка/@username или пересланное сообщение.",
+        "id_lookup_result": "🆔 <b>ID определён</b>\n\n📌 Тип: <b>{kind}</b>\n👤 Название: <b>{name}</b>\n🔢 ID: <code>{chat_id}</code>",
+        "id_lookup_invalid": "⚠️ ID не определён. Отправьте публичную ссылку/@username канала или группы либо контакт/пересланное сообщение пользователя.",
+        "id_lookup_private_invite": "⚠️ По private invite (+...) Bot API не может определить ID. Перешлите сообщение из канала/группы или отправьте ссылку t.me/c/... .",
         "support": "🆘 Поддержка",
         "image_section": "🖼 Раздел картинок",
         "btn_remove_bg": "✂️ Удалить фон",
@@ -819,7 +862,7 @@ TRANSLATIONS = {
         "btn_create_profile": "➕ Создать профиль",
         "btn_restore_profile": "🔄 Восстановить",
         "privacy_notice": "🔒 <b>Уважаемый пользователь!</b>\n\nВаши данные профиля не будут переданы третьим лицам. Конфиденциальность и безопасность гарантированы. ✅",
-        "about_text": "🤖 <b>Dono Bot — Ваш универсальный помощник!</b>\n\nЭтот бот создан для упрощения ваших повседневных задач:\n\n📥 <b>Загрузчик медиа:</b> Скачивайте видео и аудио из YouTube, Instagram и Facebook.\n🎵 <b>Мир музыки:</b> Ищите музыку, извлекайте аудио из видео и распознавайте треки через Shazam.\n🗣 <b>Голосовые услуги:</b> Преобразуйте текст в речь и голосовые сообщения в текст.\n🖼 <b>Редактор изображений:</b> Удаляйте фон и применяйте фильтры.\n🔄 <b>Профессиональный переводчик:</b> Переводите тексты между UZ, RU и EN.\n📢 <b>Рекламные услуги:</b> Продвигайте свои товары через бота.\n🆘 <b>Живое общение:</b> Связывайтесь с администраторами.\n\n🔒 <b>Безопасность:</b> Все ваши данные конфиденциальны.",
+        "about_text": "🤖 <b>Dono Bot — универсальный помощник!</b>\n\n📥 <b>Медиа:</b> загрузка с YouTube, Instagram и Facebook.\n🎵 <b>Музыка:</b> поиск, извлечение аудио и распознавание через Shazam.\n🗣 <b>Голос:</b> текст → речь и голос → текст.\n🖼 <b>Изображения:</b> удаление фона и чёрно-белый фильтр.\n📢 <b>Реклама:</b> оформление рекламных услуг.\n💾 <b>Сохранённые:</b> музыка, видео и изображения.\n🆘 <b>Поддержка:</b> живой чат с администратором и отзыв после завершения.\n🔄 <b>Перевод:</b> узбекский, русский и английский.\n🆔 <b>ID:</b> безопасный выбор канала или группы через Telegram.\n\n🔐 <b>Конфиденциальность:</b> данные профиля используются только для услуг, связанных с рекламой.\n🛡 <b>Безопасность:</b> бот не запрашивает пароли или коды Telegram.\n\n⚠️ Внешние платформы могут иметь собственные ограничения.",
         "error": "⚠️ Произошла ошибка.",
         "msg_wait_admin": "Ваше сообщение отправлено администратору, ожидайте ответа. ⏳",
         "rate_bot": "Пожалуйста, оцените бота (1-5): ⭐",
@@ -929,6 +972,14 @@ TRANSLATIONS = {
         "shazam_btn": "🎵 Shazam (Find Music)",
         "my_videos": "📹 My Videos",
         "my_images": "🖼 My Images",
+        "id_lookup": "🆔 Channel/Group ID",
+        "id_lookup_select": "📂 Choose from Telegram",
+        "id_lookup_manual": "✏️ By link/@username",
+        "id_lookup_choose": "📂 <b>Find a Telegram channel/group ID</b>\n\n✏️ Send an @username or t.me link.\n📨 Or forward a message from the channel/group.",
+        "id_lookup_prompt": "🆔 <b>ID Finder</b>\n\nChoose a Telegram channel or group below.\n\nIf needed, you can also use a link/@username.",
+        "id_lookup_result": "🆔 <b>ID found</b>\n\n📌 Type: <b>{kind}</b>\n👤 Name: <b>{name}</b>\n🔢 ID: <code>{chat_id}</code>",
+        "id_lookup_invalid": "⚠️ ID not found. Send a public channel/group link/@username or a user's contact/forwarded message.",
+        "id_lookup_private_invite": "⚠️ Bot API cannot resolve a private invite (+...) directly. Forward a message from the channel/group or send a t.me/c/... link.",
         "support": "🆘 Support",
         "image_section": "🖼 Image Section",
         "btn_remove_bg": "✂️ Remove Background",
@@ -1066,7 +1117,7 @@ TRANSLATIONS = {
         "btn_create_profile": "➕ Create Profile",
         "btn_restore_profile": "🔄 Restore Profile",
         "privacy_notice": "🔒 <b>Dear User!</b>\n\nYour profile data will not be shared with 3rd parties. Privacy and security are fully guaranteed. ✅",
-        "about_text": "🤖 <b>Dono Bot — Your Universal Assistant!</b>\n\nThis bot is designed to simplify your daily tasks:\n\n📥 <b>Media Downloader:</b> Download videos and audio from YouTube, Instagram, and Facebook.\n🎵 <b>Music World:</b> Search music, extract audio from video, and identify tracks with Shazam.\n🗣 <b>Voice Services:</b> Convert text to speech and voice messages to text.\n🖼 <b>Image Editor:</b> Remove backgrounds and apply filters.\n🔄 <b>Professional Translator:</b> Translate text between UZ, RU, and EN.\n📢 <b>Advertising:</b> Promote your products through the bot.\n🆘 <b>Live Support:</b> Contact admins directly.\n\n🔒 <b>Security:</b> Your data is kept confidential.",
+        "about_text": "🤖 <b>Dono Bot — your universal assistant!</b>\n\n📥 <b>Media:</b> download from YouTube, Instagram and Facebook.\n🎵 <b>Music:</b> search, extract audio and identify tracks with Shazam.\n🗣 <b>Voice:</b> text → speech and voice → text.\n🖼 <b>Images:</b> background removal and black-and-white filter.\n📢 <b>Advertising:</b> submit advertising service requests.\n💾 <b>Saved:</b> music, videos and images.\n🆘 <b>Support:</b> live admin chat and feedback after the chat ends.\n🔄 <b>Translation:</b> Uzbek, Russian and English.\n🆔 <b>ID Finder:</b> safely choose a channel or group using Telegram's native picker.\n\n🔐 <b>Privacy:</b> profile data is used only for advertising-related services.\n🛡 <b>Security:</b> the bot does not ask for Telegram passwords or login codes.\n\n⚠️ External platforms may have their own limits.",
         "error": "⚠️ An error occurred.",
         "msg_wait_admin": "Your message has been sent to the admin, please wait for a reply. ⏳",
         "rate_bot": "Please rate the bot (1-5): ⭐",
@@ -1344,52 +1395,107 @@ def make_progress_bar(value: int, total: int, length: int = 10) -> str:
 # Tarjima kesh (Google rate-limit oldini olish)
 _TRANSLATION_CACHE: Dict[str, str] = {}
 
-def _translate_sync(source_lang: str, target_lang: str, text_to_translate: str) -> str:
-    """Tarjimani bloklamaydigan sinxron worker.
-    Avval deep-translator, keyin Google Translate endpoint ishlatiladi.
-    """
-    source_lang = (source_lang or "").lower().strip()
-    target_lang = (target_lang or "").lower().strip()
-    text_to_translate = (text_to_translate or "").strip()
+def _mymemory_translate_chunk(source_lang: str, target_lang: str, chunk: str) -> str:
+    """MyMemory public translation endpoint. Google 429 bo'lsa ham tarjimani davom ettirish uchun."""
+    query = urllib.parse.urlencode({
+        "q": chunk,
+        "langpair": f"{source_lang}|{target_lang}",
+    })
+    url = "https://api.mymemory.translated.net/get?" + query
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "DonoYordamchiBot/1.0",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if payload.get("responseStatus") != 200:
+        raise RuntimeError(str(payload.get("responseDetails") or "MyMemory translation failed"))
+    translated = ((payload.get("responseData") or {}).get("translatedText") or "").strip()
+    if not translated:
+        raise RuntimeError("MyMemory bo'sh javob qaytardi")
+    return translated
 
-    if source_lang not in {"uz", "ru", "en"} or target_lang not in {"uz", "ru", "en"}:
+
+def _google_translate_chunk(source_lang: str, target_lang: str, chunk: str) -> str:
+    """Google GTX fallback. 429 bo'lsa darhol boshqa provayderga qaytish uchun xatoni qaytaradi."""
+    query = urllib.parse.urlencode({"client": "gtx", "sl": source_lang, "tl": target_lang, "dt": "t", "q": chunk})
+    url = "https://translate.googleapis.com/translate_a/single?" + query
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    })
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    parts = payload[0] if isinstance(payload, list) and payload else []
+    translated = "".join(part[0] for part in parts if isinstance(part, list) and part and isinstance(part[0], str)).strip()
+    if not translated:
+        raise RuntimeError("Google Translate bo'sh javob qaytardi")
+    return translated
+
+def _split_translation_text(text: str, max_chars: int = 1200) -> list[str]:
+    """Google URL uzunligi limitiga urilmaslik uchun matnni mazmunli bo'laklarga ajratadi."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for paragraph in text.splitlines(keepends=True):
+        if len(paragraph) > max_chars:
+            words = paragraph.split(" ")
+            for word in words:
+                candidate = word if not current else current + " " + word
+                if len(candidate) > max_chars:
+                    if current:
+                        chunks.append(current)
+                    current = word
+                else:
+                    current = candidate
+            continue
+
+        candidate = current + paragraph
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = paragraph
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def _translate_sync(source_lang: str, target_lang: str, text_to_translate: str) -> str:
+    """UZ/RU/EN tarjimasi. Avval MyMemory, keyin Google GTX fallback."""
+    source_lang = (source_lang or "").lower().strip(); target_lang = (target_lang or "").lower().strip()
+    text_to_translate = (text_to_translate or "").strip()
+    supported = {"uz", "ru", "en"}
+    if source_lang not in supported or target_lang not in supported:
         raise ValueError("Qo'llab-quvvatlanmaydigan til")
     if not text_to_translate:
         raise ValueError("Tarjima uchun matn bo'sh")
     if source_lang == target_lang:
         return text_to_translate
 
-    if GOOGLE_TRANSLATOR_AVAILABLE and GoogleTranslator is not None:
+    # MyMemory uchun kichik bo'laklar: bepul endpointda uzunlik/rate-limit muammosi kamroq.
+    chunks = _split_translation_text(text_to_translate, max_chars=450)
+    translated_chunks = []
+    for chunk in chunks:
+        last_error = None
         try:
-            result = GoogleTranslator(source=source_lang, target=target_lang).translate(text_to_translate)
-            if result and result.strip():
-                return result.strip()
+            translated_chunks.append(_mymemory_translate_chunk(source_lang, target_lang, chunk))
+            continue
         except Exception as exc:
-            logger.warning("deep-translator ishlamadi, fallback ishlatiladi: %s", exc)
-
-    query = urllib.parse.urlencode({
-        "client": "gtx",
-        "sl": source_lang,
-        "tl": target_lang,
-        "dt": "t",
-        "q": text_to_translate,
-    })
-    url = "https://translate.googleapis.com/translate_a/single?" + query
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    parts = payload[0] if isinstance(payload, list) and payload else []
-    translated = "".join(
-        part[0] for part in parts
-        if isinstance(part, list) and part and isinstance(part[0], str)
-    ).strip()
-    if not translated:
-        raise RuntimeError("Tarjima serveridan bo'sh javob qaytdi")
-    return translated
-
+            last_error = exc
+            logger.warning("MyMemory tarjimasi ishlamadi: %s", exc)
+        # MyMemory ishlamasa Google GTXni bir marta sinaymiz. 429 bo'lsa retry qilib vaqt ketkazmaymiz.
+        try:
+            translated_chunks.append(_google_translate_chunk(source_lang, target_lang, chunk))
+            continue
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Google GTX tarjimasi ishlamadi: %s", exc)
+        raise RuntimeError(f"Tarjima xizmatlari vaqtincha ishlamadi: {last_error}")
+    return "".join(translated_chunks).strip()
 
 def get_text(key: str, lang: str = 'uz', **kwargs) -> str:
     """
@@ -1566,6 +1672,7 @@ def main_menu_keyboard(is_admin: bool = False, lang: str = 'uz', user_name: Opti
     builder.add(InlineKeyboardButton(text=get_text("feedback", lang), callback_data="menu_feedback"))
     builder.add(InlineKeyboardButton(text=get_text("about", lang), callback_data="menu_about"))
     builder.add(InlineKeyboardButton(text=get_text("translate", lang), callback_data="menu_translate")) # Hamma uchun profil tepasida
+    builder.add(InlineKeyboardButton(text=get_text("id_lookup", lang), callback_data="menu_id_lookup"))
     builder.add(InlineKeyboardButton(text=get_text("profile", lang), callback_data="menu_profile"))
     builder.add(InlineKeyboardButton(text=get_text("settings", lang), callback_data="menu_settings"))
     if is_admin:
@@ -2088,7 +2195,8 @@ class SubscriptionMiddleware:
             "menu_music", "menu_about", "music_start_search", "menu_my_music", "menu_my_videos", "my_music_search_start",
             "menu_main", "voice_to_text", "video_to_mp3", "menu_video", "menu_image", "save_current_video", "save_current_music",
             "menu_settings", "set_lang_uz", "set_lang_ru", "set_lang_en", "video_mode_round", "video_mode_link",
-            "delete_all_videos_ask", "confirm_delete_videos_yes", "confirm_delete_videos_no", "restore_all_videos", "menu_feedback"
+            "delete_all_videos_ask", "confirm_delete_videos_yes", "confirm_delete_videos_no", "restore_all_videos", "menu_feedback",
+            "menu_translate", "menu_my_images", "menu_id_lookup"
         ]
         
         is_creating_profile = False
@@ -2097,7 +2205,7 @@ class SubscriptionMiddleware:
                 is_creating_profile = True
         elif isinstance(event, CallbackQuery):
             if (event.data in allowed_callbacks or
-                any(event.data.startswith(p) for p in ["region_", "district_", "neigh_", "music_", "yt_", "dl_", "play_", "my_music_", "my_videos_", "insta_", "save_current_music", "del_music_btn_", "del_video_btn_", "save_lang_"])):
+                any(event.data.startswith(p) for p in ["region_", "district_", "neigh_", "music_", "yt_", "dl_", "play_", "my_music_", "my_videos_", "insta_", "save_current_music", "del_music_btn_", "del_video_btn_", "save_lang_", "translate_from_", "translate_to_", "idpick_"])):
                 is_creating_profile = True
 
         if not await db.has_profile(user_id) and not is_creating_profile:
@@ -2111,7 +2219,7 @@ class SubscriptionMiddleware:
                 UserStates.support_chat.state, UserStates.complaint.state, UserStates.edit_music.state,
                 UserStates.edit_full_name.state, UserStates.edit_region.state, UserStates.edit_district.state,
                 UserStates.edit_neighborhood.state, UserStates.edit_phone.state, UserStates.edit_location.state, 
-                UserStates.confirm_delete.state, UserStates.edit_video_caption.state, UserStates.edit_image_caption.state
+                UserStates.confirm_delete.state, UserStates.edit_video_caption.state, UserStates.edit_image_caption.state, UserStates.id_lookup.state
             ] # noqa
 
             profile_states = [
@@ -2198,41 +2306,45 @@ async def start_handler(message: Message, state: FSMContext, bot: Bot):
     first_name = message.from_user.first_name
 
     current_time = time.time()
+    username = message.from_user.username or ""
+    last_name = message.from_user.last_name or ""
+    is_admin = await is_user_admin(user_id)
 
-    timestamps = START_COMMAND_LIMITS.get(user_id, [])
-    timestamps = [t for t in timestamps if current_time - t < 60]  # 1 daqiqalik vaqt oralig'i
-    timestamps.append(current_time)
-    START_COMMAND_LIMITS[user_id] = timestamps
+    # ADMINLAR UCHUN /start rate-limit, temporary block va CAPTCHA mutlaqo ishlamaydi.
+    # Admin /start ni xohlagancha qayta-qayta bosishi mumkin.
+    if not is_admin:
+        timestamps = START_COMMAND_LIMITS.get(user_id, [])
+        timestamps = [t for t in timestamps if current_time - t < 60]
+        timestamps.append(current_time)
+        START_COMMAND_LIMITS[user_id] = timestamps
 
-    # Check if user is already temp blocked from DB
-    user_db = await db.get_user(user_id)
-    if user_db and len(user_db) > 21 and user_db[21]: # temp_block_until is at index 21
-        expire_time = datetime.fromisoformat(user_db[21]).timestamp()
-        if current_time < expire_time:
-            wait_time = int((expire_time - current_time) / 60) + 1
-            msg = f"🚫 {first_name}, siz /start buyrug'ini juda tez-tez yuboryapsiz!\nBot {wait_time} daqiqaga vaqtincha bloklandi.\nIltimos kuting."
-            await message.answer(msg, parse_mode="HTML")
+        user_db = await db.get_user(user_id)
+        if user_db and len(user_db) > 21 and user_db[21]:
+            try:
+                expire_time = datetime.fromisoformat(user_db[21]).timestamp()
+            except (TypeError, ValueError):
+                expire_time = 0
+            if current_time < expire_time:
+                wait_time = int((expire_time - current_time) / 60) + 1
+                await message.answer(
+                    f"🚫 {first_name}, siz vaqtincha bloklangansiz.\n⏳ {wait_time} daqiqa kuting.",
+                    parse_mode="HTML",
+                )
+                return
+
+        if len(timestamps) > 5:
+            temp_block_until = (datetime.now() + timedelta(minutes=5)).isoformat()
+            await db.update_user_field(user_id, "temp_block_until", temp_block_until)
+            START_COMMAND_LIMITS[user_id] = []
+            asyncio.create_task(send_unblock_notification(bot, user_id))
+            notify_text = get_text("admin_notify_flood", 'uz', user=escape(first_name), user_id=user_id)
+            asyncio.create_task(notify_admins(bot, notify_text))
+            await message.answer(
+                f"🚫 {first_name}, /start juda ko'p yuborildi.\nBot 5 daqiqaga vaqtincha bloklandi.",
+                parse_mode="HTML",
+            )
             return
 
-    # Agar 1 daqiqa ichida 10 martadan ko'p /start yuborilsa, 5 daqiqaga vaqtincha bloklanadi.
-    if len(timestamps) > 5: # Reduced limit to 5 to be more strict
-        temp_block_until = (datetime.now() + timedelta(minutes=5)).isoformat()
-        await db.update_user_field(user_id, "temp_block_until", temp_block_until)
-        START_COMMAND_LIMITS[user_id] = []  # Hisoblagichni tozalash
-        
-        # Unblock taskini ishga tushirish
-        asyncio.create_task(send_unblock_notification(bot, user_id))
-        
-        lang = await get_user_lang(user_id)
-        # Adminlarga xabar berish
-        notify_text = get_text("admin_notify_flood", 'uz', user=escape(first_name), user_id=user_id)
-        asyncio.create_task(notify_admins(bot, notify_text))
-        
-        msg = f"🚫 {first_name}, siz /start buyrug'ini juda tez-tez yuboryapsiz!\nBot 5 daqiqaga vaqtincha bloklandi.\nIltimos kuting."
-        await message.answer(msg, parse_mode="HTML")
-        return  # Handler ishini to'xtatish
-
-    username = message.from_user.username or ""
     last_name = message.from_user.last_name or ""
     await db.log_action("Start", user_id, f"Username: {username}")
     is_admin = user_id in ADMIN_IDS or await db.is_user_admin(user_id)
@@ -2603,6 +2715,191 @@ async def settings_handler(callback: CallbackQuery, state: FSMContext):
         get_text("select_lang", lang),
         reply_markup=settings_language_keyboard(lang)
     )
+
+# ============================================================
+# KANAL / GURUH / FOYDALANUVCHI ID ANIQLASH
+# ============================================================
+def id_lookup_request_keyboard(lang: str):
+    """ID aniqlash uchun faqat inline tugmalar. Telegram native chat-picker
+    ReplyKeyboard talab qilgani sababli bu yerda inline orqali link/username
+    yoki forward usuli ishlatiladi; userbot dialoglari ko'rsatilmaydi."""
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=get_text("id_lookup_manual", lang), callback_data="idpick_manual"))
+    builder.row(InlineKeyboardButton(text="📨 Forward qilingan xabardan", callback_data="idpick_forward"))
+    builder.row(InlineKeyboardButton(text="👤 Foydalanuvchi contactidan", callback_data="idpick_contact"))
+    builder.row(InlineKeyboardButton(text=get_text("back_main", lang), callback_data="menu_main"))
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == "menu_id_lookup")
+async def id_lookup_menu_handler(callback: CallbackQuery, state: FSMContext):
+    lang = await get_user_lang(callback.from_user.id)
+    await state.set_state(UserStates.id_lookup)
+    await callback.message.edit_text(
+        get_text("id_lookup_prompt", lang),
+        reply_markup=id_lookup_request_keyboard(lang),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "idpick_manual")
+async def id_lookup_manual_handler(callback: CallbackQuery, state: FSMContext):
+    lang = await get_user_lang(callback.from_user.id)
+    await state.set_state(UserStates.id_lookup)
+    await callback.message.edit_text(
+        "✏️ @username, t.me havolasi yoki -100... ID yuboring.",
+        reply_markup=id_lookup_request_keyboard(lang),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "idpick_forward")
+async def id_lookup_forward_handler(callback: CallbackQuery, state: FSMContext):
+    lang = await get_user_lang(callback.from_user.id)
+    await state.set_state(UserStates.id_lookup)
+    await callback.message.edit_text(
+        "📨 Kanal yoki guruhdan bitta xabarni shu botga <b>Forward</b> qiling.",
+        reply_markup=id_lookup_request_keyboard(lang),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "idpick_contact")
+async def id_lookup_contact_prompt_handler(callback: CallbackQuery, state: FSMContext):
+    lang = await get_user_lang(callback.from_user.id)
+    await state.set_state(UserStates.id_lookup)
+    await callback.message.edit_text(
+        "👤 Foydalanuvchining contactini yuboring.\n\n"
+        "Eslatma: Telegram contact yuborishni faqat ReplyKeyboard orqali qo'llaydi.\n"
+        "Shuning uchun contact o'rniga @username yuborsangiz ham ID aniqlanadi.",
+        reply_markup=id_lookup_request_keyboard(lang),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(UserStates.id_lookup), F.chat_shared)
+async def id_lookup_chat_shared_handler(message: Message, state: FSMContext):
+    # Eski native picker uchun compatibility: agar Telegram chat_shared yuborsa, qabul qilamiz.
+    lang = await get_user_lang(message.from_user.id)
+    shared = message.chat_shared
+    chat_id = int(shared.chat_id)
+    kind = "Kanal" if shared.request_id == ID_PICK_CHANNEL_REQUEST else "Guruh"
+    await state.clear()
+    await message.answer(
+        get_text("id_lookup_result", lang, kind=kind, name="Tanlangan chat", chat_id=chat_id),
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(StateFilter(UserStates.id_lookup), F.text)
+async def id_lookup_text_handler(message: Message, state: FSMContext):
+    lang = await get_user_lang(message.from_user.id)
+    text = (message.text or "").strip()
+    if text in {"❌ Bekor qilish", "🏠 Bosh menyuga"}:
+        await state.clear()
+        await message.answer("Bekor qilindi. ✅", reply_markup=ReplyKeyboardRemove())
+        return
+    if text.startswith("@") or "t.me/" in text or text.lstrip("-").isdigit():
+        try:
+            chat = await message.bot.get_chat(text)
+            ctype = str(chat.type).lower()
+            if "channel" not in ctype and "group" not in ctype and "supergroup" not in ctype:
+                raise ValueError("not_group_or_channel")
+            kind = "Kanal" if "channel" in ctype else "Guruh"
+            name = getattr(chat, "title", None) or getattr(chat, "username", None) or "Noma'lum"
+            await state.clear()
+            await message.answer(
+                get_text("id_lookup_result", lang, kind=kind, name=escape(str(name)), chat_id=int(chat.id)),
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+        except Exception as exc:
+            logger.info("ID lookup get_chat xatosi: %s", exc)
+    await message.answer(
+        "⚠️ Chat topilmadi. @username, t.me havolasi yoki -100... ID yuboring.",
+        reply_markup=id_lookup_request_keyboard(lang),
+    )
+
+
+async def _send_resolved_id(message: Message, chat_id: int, kind: str, name: str, lang: str):
+    await message.answer(get_text("id_lookup_result", lang, kind=kind, name=escape(str(name)), chat_id=chat_id), parse_mode="HTML")
+
+
+@router.message(StateFilter(UserStates.id_lookup), F.contact)
+async def id_lookup_contact_handler(message: Message, state: FSMContext):
+    lang = await get_user_lang(message.from_user.id)
+    contact = message.contact
+    if contact.user_id:
+        await _send_resolved_id(message, contact.user_id, "Foydalanuvchi", contact.first_name or "Foydalanuvchi", lang)
+    else:
+        await message.answer(get_text("id_lookup_invalid", lang))
+
+
+@router.message(StateFilter(UserStates.id_lookup))
+async def id_lookup_message_handler(message: Message, state: FSMContext):
+    lang = await get_user_lang(message.from_user.id)
+    origin = getattr(message, "forward_origin", None)
+    if origin:
+        sender_user = getattr(origin, "sender_user", None)
+        sender_chat = getattr(origin, "sender_chat", None)
+        if sender_user:
+            await _send_resolved_id(message, sender_user.id, "Foydalanuvchi", sender_user.full_name, lang)
+            return
+        if sender_chat:
+            await _send_resolved_id(message, sender_chat.id, "Kanal/Guruh", _id_lookup_name(sender_chat), lang)
+            return
+    if getattr(message, "forward_from", None):
+        u = message.forward_from
+        await _send_resolved_id(message, u.id, "Foydalanuvchi", u.full_name, lang)
+        return
+    if getattr(message, "forward_from_chat", None):
+        c = message.forward_from_chat
+        await _send_resolved_id(message, c.id, "Kanal/Guruh", _id_lookup_name(c), lang)
+        return
+
+    text = (message.text or "").strip()
+    direct_id, direct_kind = _id_lookup_from_text(text)
+    if direct_id is not None:
+        try:
+            chat = await message.bot.get_chat(direct_id)
+            ctype = getattr(chat, "type", "")
+            kind = "Kanal" if ctype == "channel" else ("Guruh" if "group" in ctype else direct_kind)
+            await _send_resolved_id(message, chat.id, kind, _id_lookup_name(chat), lang)
+        except Exception as exc:
+            if direct_kind == "Kanal/Guruh":
+                await _send_resolved_id(message, direct_id, direct_kind, "Private chat link", lang)
+            else:
+                logger.error("ID direct chat tekshiruvi xatosi: %s", exc, exc_info=True)
+                await message.answer(get_text("id_lookup_invalid", lang))
+        return
+    if re.search(r"(?:t\.me|telegram\.me)/\+", text, re.I):
+        await message.answer(get_text("id_lookup_private_invite", lang))
+        return
+
+    username = None
+    if re.fullmatch(r"@?[A-Za-z0-9_]{5,32}", text):
+        username = text if text.startswith("@") else "@" + text
+    else:
+        m = re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{5,32})(?:\?.*)?$", text, re.I)
+        if m and m.group(1).lower() not in {"c", "joinchat"}:
+            username = "@" + m.group(1)
+    if username:
+        try:
+            chat = await message.bot.get_chat(username)
+            ctype = getattr(chat, "type", "")
+            kind = "Kanal" if ctype == "channel" else ("Guruh" if "group" in ctype else "Chat")
+            await _send_resolved_id(message, chat.id, kind, _id_lookup_name(chat), lang)
+            return
+        except Exception as exc:
+            logger.error("Public username ID aniqlash xatosi: username=%s: %s", username, exc, exc_info=True)
+    await message.answer(get_text("id_lookup_invalid", lang))
+
 
 @router.callback_query(F.data == "menu_music")
 async def music_handler(callback: CallbackQuery, state: FSMContext):
@@ -3132,13 +3429,12 @@ async def music_search_perform(message: Message, state: FSMContext, query_text: 
             try:
                 ydl_opts = {
                     'quiet': True,
-                    'default_search': 'ytsearch10',  # 20 ta kifoya
+                    'default_search': 'ytsearch100',  # 100 ta natija
                     'noplaylist': True,
                     'extract_flat': "in_playlist",
                     'skip_download': True, 
                     'add_metadata': False,
                     'ignoreerrors': True,
-                    'source_address': '0.0.0.0', # IPv4 forcelash
                     'http_headers': {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -3162,7 +3458,7 @@ async def music_search_perform(message: Message, state: FSMContext, query_text: 
 
                 loop = asyncio.get_event_loop()
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl: # type: ignore
-                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch10:{query}", download=False))
+                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch100:{query}", download=False))
                 
                 if info is None:
                     logger.error("⚠️ YouTube qidiruvda ma'lumot qaytarilmadi. Manba: %s", auth_source)
@@ -3417,9 +3713,10 @@ async def process_image_handler(message: Message, state: FSMContext):
         def process_sync():
             img = Image.open(input_path)
             if current_state == UserStates.image_rm_bg:
-                if not REMBG_AVAILABLE:
-                    return None # Signal that it failed
-                output = remove_bg(img)
+                bg_remover = _get_remove_bg()
+                if bg_remover is None:
+                    return None # rembg o'rnatilmagan
+                output = bg_remover(img)
                 output.save(output_path, "PNG")
             elif current_state == UserStates.image_filter:
                 img = ImageOps.grayscale(img)
@@ -3510,7 +3807,6 @@ async def yt_shazam_full_callback(callback: CallbackQuery, state: FSMContext):
             }},
             'quiet': True, 'ignoreerrors': True, # Qayta urinish uchun ignoreerrors
             'noplaylist': True,
-            'source_address': '0.0.0.0',
         }
         apply_youtube_auth(ydl_opts, youtube_auth_sources()[0])
         
@@ -3694,7 +3990,6 @@ async def insta_shazam_music_callback(callback: CallbackQuery, state: FSMContext
             'cookiefile': INSTAGRAM_COOKIES_PATH,
             'ignoreerrors': True,
             'retries': 10,
-            'source_address': '0.0.0.0',
             'buffersize': 1024 * 1024 * 10,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -3968,7 +4263,6 @@ async def show_my_videos(message_or_callback: Union[Message, CallbackQuery], sta
             builder.add(InlineKeyboardButton(text=get_text("back_to_video", lang), callback_data="menu_video"))
             builder.add(InlineKeyboardButton(text=get_text("back_main", lang), callback_data="menu_main"))
             kb = builder.as_markup()
-        await state.clear()
     else:
         ITEMS_PER_PAGE = 10
         total_pages = (len(saved_videos) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
@@ -4137,9 +4431,31 @@ async def save_video_caption_handler(message: Message, state: FSMContext):
 # --- Rasmlarim Bo'limi (Yangi) ---
 @router.callback_query(F.data == "menu_my_images")
 async def my_images_handler(callback: CallbackQuery, state: FSMContext):
+    """Saqlangan rasmlarni ko'rsatadi va shu holatda yangi rasmlarni qabul qiladi."""
     user_id = callback.from_user.id
     lang = await get_user_lang(user_id)
     await show_my_images(callback, state, user_id, lang, page=0)
+    await callback.answer("📥 Yangi rasmlarni ham yuborishingiz mumkin.")
+
+@router.message(StateFilter(UserStates.my_images), F.photo)
+async def my_images_receive_photo_handler(message: Message, state: FSMContext):
+    """my_images holatida kelgan har bir rasmni avtomatik saqlaydi."""
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    photo = message.photo[-1]
+    caption = (message.caption or "Rasm").strip()[:500]
+    try:
+        saved = await db.save_image(user_id, photo.file_id, caption or "Rasm")
+        if saved:
+            await db.add_download_stat(user_id, "user_image_upload")
+            images_now = await db.get_saved_images(user_id)
+            image_no = next((i + 1 for i, row in enumerate(images_now) if row[1] == photo.file_id), len(images_now))
+            await message.answer(f"✅ Rasm #{image_no} saqlandi.\n📥 Yana rasm yuborishingiz mumkin.")
+        else:
+            await message.answer(get_text("image_already_saved", lang))
+    except Exception as exc:
+        logger.error("Rasmni DB ga saqlash xatosi: %s", exc, exc_info=True)
+        await message.answer("⚠️ Rasmni saqlashda xatolik yuz berdi. Terminal logini tekshiring.")
 
 async def show_my_images(message_or_callback: Union[Message, CallbackQuery], state: FSMContext, user_id: int, lang: str, page: int = 0):
     message = message_or_callback if isinstance(message_or_callback, Message) else message_or_callback.message
@@ -4162,13 +4478,13 @@ async def show_my_images(message_or_callback: Union[Message, CallbackQuery], sta
         end_idx = start_idx + ITEMS_PER_PAGE
         current_items = saved_images[start_idx:end_idx]
 
-        text = f"{get_text('my_images_list_header', lang)}\n{get_text('page_label', lang)}: <b>{page+1}/{total_pages}</b>\n\n"
+        text = f"{get_text('my_images_list_header', lang)}\n{get_text('page_label', lang)}: <b>{page+1}/{total_pages}</b>\n\n📥 Yangi rasm yuborsangiz, avtomatik saqlanadi.\n\n"
         
         builder = InlineKeyboardBuilder()
         btn_row = []
         for i, img in enumerate(current_items):
-            display_idx = i + 1
-            text += f"<b>{display_idx}.</b> {escape(img[2])}\n"
+            display_idx = start_idx + i + 1
+            text += f"<b>#{display_idx}</b> {escape(img[2])}\n"
             btn_row.append(InlineKeyboardButton(text=str(display_idx), callback_data=f"play_saved_image_{img[0]}"))
             
             if len(btn_row) == 5:
@@ -4376,7 +4692,7 @@ async def _perform_music_download(message: Message, video_id: str, user_id: int,
         # Bu vaqtni va trafikni tejaydi.
         try:
             # 1. Avval videoning ma'lumotlarini (nomini) yuklab olamiz
-            temp_ydl_opts = {'quiet': True, 'skip_download': True, 'source_address': '0.0.0.0'}
+            temp_ydl_opts = {'quiet': True, 'skip_download': True}
             with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 video_title = info.get('title')
@@ -4461,7 +4777,7 @@ async def _perform_music_download(message: Message, video_id: str, user_id: int,
                             'remote_components': True
                         }},
                         'progress_hooks': [hook],
-                        'nocheckcertificate': True,
+                        'nocheckcertificate': False,
                     }
                     apply_youtube_auth(ydl_opts, auth_source)
                     source_type, source_value = auth_source
@@ -4839,7 +5155,7 @@ def _instagram_web_media_download_sync(url: str, auth_source, out_dir: str, pref
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "nocheckcertificate": True,
+        "nocheckcertificate": False,
         "socket_timeout": 30,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
@@ -4945,13 +5261,8 @@ async def ensure_telegram_compatible_video(input_path: str) -> str:
 
     output_path = os.path.splitext(input_path)[0] + "_compatible.mp4"
     if compatible and os.path.splitext(input_path)[1].lower() == ".mp4":
-        # stream copy + faststart: juda tez, sifat yo'qolmaydi.
-        process = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", input_path,
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-c", "copy", "-movflags", "+faststart", output_path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-        )
+        # Allaqachon H.264/AAC MP4 — umuman qayta ishlamaymiz.
+        return input_path
     else:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", input_path,
@@ -5033,8 +5344,7 @@ async def download_instagram_media(message: Message, url: str, shortcode: str):
                 "file_access_retries": 2,
                 "socket_timeout": 30,
                 "concurrent_fragment_downloads": 4,
-                "source_address": "0.0.0.0",
-                "nocheckcertificate": True,
+                "nocheckcertificate": False,
                 "http_headers": {
                     "User-Agent": (
                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -5291,9 +5601,9 @@ async def _perform_generic_video_download(message: Message, url: str, user_id: i
         ydl_opts = {
             'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'merge_output_format': 'mp4',
-            'nocheckcertificate': True, 'geo_bypass': True,
+            'nocheckcertificate': False, 'geo_bypass': True,
             'outtmpl': f"downloads/{unique_id}.%(ext)s",
-            'quiet': True, 'geo_bypass': True, 'ignoreerrors': False,
+            'quiet': True, 'ignoreerrors': False,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -5429,7 +5739,11 @@ async def _perform_youtube_download(
     # qayta-qayta urish serverni faqat qotirib qo'yadi. Har bir auth uchun
     # faqat bitta asosiy format va bitta sodda fallback ishlatiladi.
     max_height = int(resolution) if resolution and str(resolution).isdigit() else 1080
+    # 1080p uchun alohida video+audio stream kerak bo‘lishi mumkin.
+    # Avval talab qilingan sifatni olamiz; timeout juda qisqa bo‘lsa 1080p o‘rtada uzilib qolardi.
     format_options = [
+        f"bestvideo[height<={max_height}][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a]/best[height<={max_height}][vcodec^=avc1][ext=mp4]",
+        f"bestvideo[height<={max_height}][vcodec^=avc1]+bestaudio/best[height<={max_height}][vcodec^=avc1]",
         f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best",
         "best[height<=720]/best",
     ]
@@ -5474,7 +5788,7 @@ async def _perform_youtube_download(
                         outtmpl=filename,
                         progress_hook=hook,
                         extra={
-                            "add_metadata": True,
+                            "add_metadata": False,
                             # Formatlarni ketma-ket almashtirib qotib qolmasin.
                             "retries": 2,
                             "fragment_retries": 2,
@@ -5485,13 +5799,15 @@ async def _perform_youtube_download(
                         },
                     )
                     apply_youtube_auth(ydl_opts, auth_source)
+                    # 2026-yil YouTube client o‘zgarishlari sabab cookie bilan default/tv_downgraded
+                    # ba'zan "The page needs to be reloaded" beradi. Avval web_embedded, keyin default
+                    # ishlatiladi; cookiesiz rejimda android ham qo‘shiladi, chunki ayrim videolarda u
+                    # SABR/403 muammosini chetlab o'tadi.
+                    yt_args = ydl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})
                     if source_type == "none":
-                        # Cookiesiz rejimda bot-detectionni kamaytirish uchun PO-token talab qilmaydigan
-                        # clientlardan foydalanamiz. Authenticated rejimda esa yt-dlp ning current default
-                        # client selectioni ishlaydi.
-                        ydl_opts.setdefault("extractor_args", {}).setdefault("youtube", {})[
-                            "player_client"
-                        ] = ["tv", "web_embedded"]
+                        yt_args["player_client"] = ["android", "web_embedded"]
+                    else:
+                        yt_args["player_client"] = ["web_embedded", "default"]
 
                     logger.info(
                         "YouTube: Auth=%s, Format=%s",
@@ -5508,7 +5824,7 @@ async def _perform_youtube_download(
                                         url, download=True
                                     ),
                                 ),
-                                timeout=90.0,
+                                timeout=600.0,
                             )
 
                             if not info:
@@ -5636,7 +5952,7 @@ async def _perform_youtube_download(
 
                 except asyncio.TimeoutError:
                     last_exception = TimeoutError(
-                        "YouTube yuklash 120 soniyada tugamadi."
+                        "YouTube yuklash 10 daqiqada tugamadi."
                     )
                     logger.warning(
                         "YouTube timeout: auth=%s format=%s",
@@ -6339,8 +6655,6 @@ async def support_handler(callback: CallbackQuery, bot: Bot, state: FSMContext):
     await callback.message.edit_text(get_text("support_request_sent", lang), reply_markup=support_waiting_keyboard(lang))
 
     # Adminga xabar yoborish
-    user_data = await db.get_user(user_id)
-    profile_text = await get_user_profile_text(user_data, lang, for_admin=True)
     username = callback.from_user.username or "noma'lum"
 
     if not ADMIN_IDS:
@@ -6356,7 +6670,8 @@ async def support_handler(callback: CallbackQuery, bot: Bot, state: FSMContext):
                 admin_id,
                 f"🆘 <b>Yangi muloqot so'rovi!</b>\n\n"
                 f"Foydalanuvchi ID: <code>{user_id}</code> (@{username})\n\n"
-                f"{profile_text}\n\n"
+                f"👤 Foydalanuvchi qo'llab-quvvatlash xizmatiga murojaat qildi.\n"
+                f"🔐 Profil ma'lumotlari reklama xizmatidan tashqari yuborilmaydi.\n\n"
                 f"👇 Tasdiqlash yoki bekor qilish:",
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -6367,7 +6682,7 @@ async def support_handler(callback: CallbackQuery, bot: Bot, state: FSMContext):
 
 
 @router.callback_query(lambda c: c.data.startswith("accept_support_"))
-async def accept_support_callback(callback: CallbackQuery, bot: Bot):
+async def accept_support_callback(callback: CallbackQuery, bot: Bot, state: FSMContext):
     user_id = int(callback.data.split("_")[2])
     admin_id = callback.from_user.id
     lang = await get_user_lang(user_id)
@@ -6375,6 +6690,7 @@ async def accept_support_callback(callback: CallbackQuery, bot: Bot):
     if await db.get_active_admin(user_id) is None and await db.is_pending_support(user_id):
         await db.set_pending_support(user_id, False)
         await db.set_active_chat(user_id, admin_id)
+        await state.set_state(AdminStates.support_chat)
         await db.log_action("Support Start", user_id, f"Admin: {admin_id}")
         await callback.answer("Chat qabul qilindi! ✅")
 
@@ -6420,42 +6736,116 @@ async def reject_support_callback(callback: CallbackQuery, bot: Bot):
         await callback.answer("So'rov allaqachon ishlov berilgan. ⚠️")
 
 
+async def _support_active_users(admin_id: int) -> list[int]:
+    try:
+        async with db.get_connection() as conn:
+            async with conn.execute(
+                "SELECT user_id FROM active_chats WHERE admin_id = ? ORDER BY user_id",
+                (admin_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return [int(row[0]) for row in rows]
+    except Exception as exc:
+        logger.error("Support active chatlarini olishda xato: %s", exc)
+        return []
+
+
+def _support_user_from_reply(message: Message) -> Optional[int]:
+    reply = message.reply_to_message
+    if not reply:
+        return None
+    key = (message.chat.id, reply.message_id)
+    mapped = SUPPORT_ADMIN_MESSAGE_MAP.get(key)
+    if mapped:
+        return mapped
+    text = reply.text or reply.caption or ""
+    patterns = (
+        r"Foydalanuvchi(?:dan)?(?: ID)?[: ]+<?(?:code>)?(\d+)",
+        r"USER_ID[:= ]+(\d+)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+async def _resolve_admin_support_user(message: Message) -> Optional[int]:
+    admin_id = message.from_user.id
+    reply_user = _support_user_from_reply(message)
+    if reply_user is not None and await db.get_active_admin(reply_user) == admin_id:
+        return reply_user
+    active = await _support_active_users(admin_id)
+    if len(active) == 1:
+        return active[0]
+    return None
+
+
+async def _forward_user_support_to_admin(message: Message, bot: Bot, admin_id: int) -> None:
+    user_id = message.from_user.id
+    username = message.from_user.username or "noma'lum"
+    header = f"🆘 Foydalanuvchidan <code>{user_id}</code> (@{escape(username)})"
+    header_msg = await bot.send_message(admin_id, header + "\n↩️ Javob berish uchun shu xabarga Reply qiling.", parse_mode="HTML")
+    SUPPORT_ADMIN_MESSAGE_MAP[(admin_id, header_msg.message_id)] = user_id
+
+    if message.text is not None:
+        content = await bot.send_message(admin_id, escape(message.text), parse_mode="HTML")
+        SUPPORT_ADMIN_MESSAGE_MAP[(admin_id, content.message_id)] = user_id
+    else:
+        try:
+            copied = await bot.copy_message(admin_id, message.chat.id, message.message_id)
+            SUPPORT_ADMIN_MESSAGE_MAP[(admin_id, copied.message_id)] = user_id
+        except Exception:
+            await bot.send_message(admin_id, "📎 Foydalanuvchi media/xabar yubordi. Reply orqali javob bering.")
+
+
+async def _send_admin_support_to_user(message: Message, bot: Bot, user_id: int) -> None:
+    lang = await get_user_lang(user_id)
+    if message.text is not None:
+        await bot.send_message(user_id, f"👨‍💼 Admindan:\n{escape(message.text)}", parse_mode="HTML", reply_markup=support_active_keyboard(lang))
+    else:
+        await bot.copy_message(user_id, message.chat.id, message.message_id)
+        await bot.send_message(user_id, "👨‍💼 Admin javobi", reply_markup=support_active_keyboard(lang))
+
+
 @router.message(StateFilter(UserStates.support_chat))
 async def user_support_message(message: Message, bot: Bot, state: FSMContext):
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
-
     if message.text in ("❌ Chatni yakunlash", "🏠 Bosh menyuga"):
-        # Agar reply keyboard qolgan bo'lsa, uni ushlash uchun
         admin_id = await db.get_active_admin(user_id)
         if admin_id:
             try:
-                await bot.send_message(admin_id, get_text("chat_ended_user", lang))
-            except Exception as e:
-                logger.error(f"Adminga chat yakunlangani haqida yuborishda xato: {e}")
+                await bot.send_message(admin_id, f"🏁 Foydalanuvchi <code>{user_id}</code> chatni yakunladi.", parse_mode="HTML")
+            except Exception:
+                pass
             await db.remove_active_chat(user_id)
-
-        await clear_state_preserve_session(state)
-        await message.answer(get_text("rate_bot", lang), reply_markup=rating_keyboard())
+            await db.set_pending_support(user_id, False)
+        await state.clear()
+        await message.answer(get_text("chat_ended_rate", lang), reply_markup=like_keyboard())
         return
 
     admin_id = await db.get_active_admin(user_id)
-    if admin_id:
-        username = message.from_user.username or "noma'lum"
-        try:
-            await bot.send_message(admin_id, f"Foydalanuvchidan {user_id} (@{username}): {escape(message.text)}", parse_mode="HTML")
+    if not admin_id:
+        if await db.is_pending_support(user_id):
+            await message.answer(get_text("support_request_sent", lang), reply_markup=support_waiting_keyboard(lang))
+        else:
+            await message.answer("Chat faol emas. 🆘")
+        return
+    try:
+        await _forward_user_support_to_admin(message, bot, admin_id)
+        if message.text is not None:
             await message.answer(get_text("msg_wait_admin", lang))
-        except Exception as e:
-            logger.error("Adminga xabar yuborishda xato: %s", e)
-            await message.reply("Xabar yuborishda xato. Iltiros, qayta urinib ko'ring.")
-    else:
-        await message.reply("Chat faol emas. ⚠️")
+    except Exception as exc:
+        logger.error("User support xabarini adminga yuborishda xato: %s", exc, exc_info=True)
+        await message.answer("⚠️ Xabar yuborilmadi. Qayta urinib ko‘ring.")
+
 
 @router.callback_query(F.data == "support_cancel")
 async def support_cancel_callback(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     await db.set_pending_support(user_id, False)
-    # go_to_main_menu o'zi clear qiladi, lekin preserve qilish kerak
+    await state.clear()
     await go_to_main_menu(callback, state)
 
 
@@ -6466,62 +6856,63 @@ async def support_end_callback(callback: CallbackQuery, bot: Bot, state: FSMCont
     admin_id = await db.get_active_admin(user_id)
     if admin_id:
         try:
-            await bot.send_message(admin_id, get_text("chat_ended_user", lang))
+            await bot.send_message(admin_id, f"🏁 Foydalanuvchi <code>{user_id}</code> chatni yakunladi.", parse_mode="HTML")
         except Exception:
             pass
         await db.remove_active_chat(user_id)
+        await db.set_pending_support(user_id, False)
         await db.log_action("Support End", user_id, "User ended")
     await state.clear()
-    await callback.message.edit_text(get_text("chat_ended_rate", lang), reply_markup=rating_keyboard())
+    await callback.message.edit_text(get_text("chat_ended_rate", lang), reply_markup=like_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_end_chat_"))
-async def admin_end_chat_callback(callback: CallbackQuery, bot: Bot):
-    user_id = int(callback.data.split("_")[3])
+async def admin_end_chat_callback(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    user_id = int(callback.data.split("_")[-1])
     admin_id = callback.from_user.id
-    lang = await get_user_lang(admin_id)
-
-    if await db.get_active_admin(user_id) == admin_id:
-        await db.remove_active_chat(user_id)
-        await db.log_action("Support End", user_id, f"Admin {admin_id} ended")
-        await callback.answer("Chat yakunlandi! ✅")
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        
-        # Adminga menyuni qaytarish
-        await callback.message.answer("Chat yakunlandi. Admin panel:", reply_markup=admin_keyboard(lang))
-        
-        try:
-            await bot.send_message(
-                user_id,
-                "Admin chatni yakunladi. ❌\n\nXizmatimiz sizga yoqdimi? 😊",
-                reply_markup=like_keyboard(),
-            )
-        except Exception as e:
-            logger.error("Foydalanuvchiga xabar yuborishda xato: %s", e)
+    if await db.get_active_admin(user_id) != admin_id:
+        await callback.answer("Bu chat sizga tegishli emas. ⚠️", show_alert=True)
+        return
+    await db.remove_active_chat(user_id)
+    await db.set_pending_support(user_id, False)
+    await db.log_action("Support End", user_id, f"Admin {admin_id} ended")
+    SUPPORT_ADMIN_MESSAGE_MAP.pop((admin_id, callback.message.message_id), None)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await bot.send_message(user_id, "👨‍💼 Admin chatni yakunladi.\n\nXizmatimizni baholang:", reply_markup=like_keyboard())
+    except Exception as exc:
+        logger.error("Foydalanuvchiga chat yakuni yuborilmadi: %s", exc)
+    if not await _support_active_users(admin_id):
+        await state.clear()
+    await callback.answer("Chat yakunlandi! ✅")
 
 
 @router.message(
-    lambda m: (
-        m.from_user.id in ADMIN_IDS
-        and m.reply_to_message is not None
-        and m.reply_to_message.text is not None
-        and "Foydalanuvchidan" in m.reply_to_message.text
-    )
+    StateFilter(AdminStates.support_chat),
+    lambda m: m.from_user is not None and m.from_user.id in ADMIN_IDS and not ((m.text or "").startswith("/"))
 )
-async def admin_reply_handler(message: Message, bot: Bot):
+async def admin_support_message_handler(message: Message, bot: Bot):
+    user_id = await _resolve_admin_support_user(message)
+    if user_id is None:
+        active = await _support_active_users(message.from_user.id)
+        if len(active) > 1:
+            await message.reply("⚠️ Sizda bir nechta faol support chat bor. Kerakli foydalanuvchi xabariga Reply qiling.")
+        elif not active:
+            await message.reply("ℹ️ Hozir faol support chat yo‘q.")
+        else:
+            await message.reply("⚠️ Chat aniqlanmadi. Foydalanuvchi xabariga Reply qiling.")
+        return
     try:
-        # "Foydalanuvchidan 12345 (@user): ..."
-        after = message.reply_to_message.text.split("Foydalanuvchidan")[1]
-        user_id = int(after.strip().split()[0]) # noqa
-        if await db.get_active_admin(user_id) == message.from_user.id:
-            lang = await get_user_lang(user_id)
-            await bot.send_message(user_id, f"Admindan: {escape(message.text)}", reply_markup=support_active_keyboard(lang), parse_mode="HTML")
-            await message.reply("Xabaringiz foydalanuvchiga yuborildi, javobni kuting. ⏳")
-    except (ValueError, IndexError) as e:
-        logger.error("Admin javob parselanayotganda xato: %s", e)
+        await _send_admin_support_to_user(message, bot, user_id)
+        if message.text is not None:
+            await message.reply("✅ Xabar foydalanuvchiga yuborildi.")
+    except Exception as exc:
+        logger.error("Admin support xabarini yuborishda xato: %s", exc, exc_info=True)
+        await message.reply("❌ Xabar yuborilmadi. Foydalanuvchi bloklagan yoki chat yopilgan bo‘lishi mumkin.")
 
 
 # ============================================================
@@ -6584,28 +6975,27 @@ async def complaint_receive_handler(message: Message, state: FSMContext, bot: Bo
     )
 
 @router.message(Command("yakunlash"), lambda m: m.from_user.id in ADMIN_IDS)
-async def admin_end_chat_command(message: Message, bot: Bot):
-    if (
-        message.reply_to_message
-        and message.reply_to_message.text
-        and "Foydalanuvchidan" in message.reply_to_message.text
-    ):
-        try:
-            after = message.reply_to_message.text.split("Foydalanuvchidan")[1]
-            user_id = int(after.strip().split()[0])
-            if await db.get_active_admin(user_id) == message.from_user.id:
-                await db.log_action("Support End", user_id, f"Admin {message.from_user.id} ended (command)")
-                try:
-                    await bot.send_message(
-                        user_id,
-                        "Admin chatni yakunladi. ❌\nXizmatimiz sizga yoqdimi? 😊",
-                        reply_markup=like_keyboard(),
-                    )
-                except Exception as e:
-                    logger.error("Foydalanuvchiga xabar yuborishda xato: %s", e)
-                await message.reply("Chat yakunlandi. ❌")
-        except (ValueError, IndexError) as e:
-            logger.error("Yakunlash komandasi parselanayotganda xato: %s", e)
+async def admin_end_chat_command(message: Message, bot: Bot, state: FSMContext):
+    user_id = _support_user_from_reply(message)
+    if user_id is None:
+        user_id = await _resolve_admin_support_user(message)
+    if user_id is None:
+        await message.reply("⚠️ Yakunlash uchun foydalanuvchi xabariga Reply qiling.")
+        return
+    if await db.get_active_admin(user_id) != message.from_user.id:
+        await message.reply("⚠️ Bu foydalanuvchi sizning faol chatlaringizda yo‘q.")
+        return
+    await db.remove_active_chat(user_id)
+    await db.set_pending_support(user_id, False)
+    await db.log_action("Support End", user_id, f"Admin {message.from_user.id} ended (command)")
+    try:
+        await bot.send_message(user_id, "👨‍💼 Admin chatni yakunladi.\n\nXizmatimizni baholang:", reply_markup=like_keyboard())
+    except Exception as exc:
+        logger.error("Foydalanuvchiga chat yakuni yuborilmadi: %s", exc)
+    active = await _support_active_users(message.from_user.id)
+    if not active:
+        await state.clear()
+    await message.reply("Chat yakunlandi. ❌")
 
 
 # ============================================================
@@ -6676,6 +7066,7 @@ async def feedback_send(message: Message, bot: Bot, state: FSMContext):
 async def like_feedback_callback(callback: CallbackQuery, state: FSMContext):
     liked = 1 if callback.data == "like_yes" else 0
     user_id = callback.from_user.id
+    await db.save_feedback(user_id, liked=liked)
     await state.set_state(UserStates.rating_feedback)
 
     liked_text = "Ha!" if liked else "Yo'q!"
@@ -6701,31 +7092,54 @@ async def rating_feedback_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer(f"Rahmat! {rating} ⭐")
 
 
+async def _send_support_feedback_summary(user_id: int, bot: Bot) -> None:
+    try:
+        async with db.get_connection() as conn:
+            async with conn.execute(
+                "SELECT liked, rating, comment FROM feedback WHERE user_id = ?",
+                (user_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return
+        liked = "Ha" if row[0] == 1 else "Yo‘q" if row[0] == 0 else "Ko‘rsatilmagan"
+        rating = f"{row[1]}/5" if row[1] is not None else "Ko‘rsatilmagan"
+        comment = row[2] or "Izoh qoldirilmagan"
+        user = await db.get_user(user_id)
+        username = "noma'lum"
+        if user and len(user) > 1 and user[1]:
+            username = str(user[1])
+        summary = (
+            "📊 <b>Qo‘llab-quvvatlash yakuni</b>\n\n"
+            f"👤 ID: <code>{user_id}</code> (@{escape(username)})\n"
+            f"👍 Xizmat yoqdimi: <b>{liked}</b>\n"
+            f"⭐ Baho: <b>{rating}</b>\n"
+            f"💬 Fikr: {escape(str(comment))}"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, summary, parse_mode="HTML")
+            except Exception as exc:
+                logger.error("Feedback summary adminga yuborilmadi (%s): %s", admin_id, exc)
+    except Exception as exc:
+        logger.error("Feedback summary tayyorlashda xato: %s", exc, exc_info=True)
+
+
 @router.message(StateFilter(UserStates.comment_feedback))
 async def comment_feedback_handler(message: Message, bot: Bot, state: FSMContext):
     user_id = message.from_user.id
-    await db.save_feedback(user_id, comment=message.text)
-
-    # Feedback ma'lumotlarini adminga yuborish
-    user = await db.get_user(user_id)
+    comment = message.text or message.caption or "Fayl/media yuborildi"
+    await db.save_feedback(user_id, comment=comment)
+    await db.log_action("Support Feedback", user_id, comment[:500])
+    await _send_support_feedback_summary(user_id, bot)
+    await state.clear()
     lang = await get_user_lang(user_id)
-    profile_text = await get_user_profile_text(user, lang)
-    username = message.from_user.username or "noma'lum"
-
-    # Foydalanuvchi ismini olish
-    user = await db.get_user(user_id)
-    has_profile = await db.has_profile(user_id)
-    display_name = user[4] if (has_profile and user and user[4]) else message.from_user.first_name
-
-    await clear_state_preserve_session(state)
     is_admin = await is_user_admin(user_id)
-    lang = await get_user_lang(user_id)
-    await message.answer(get_text("feedback_thank_you_full", lang), reply_markup=main_menu_keyboard(is_admin=is_admin, lang=lang, user_name=display_name))
-    
-    # Ensure state is cleared to prevent freezing
-    # await state.clear() - Yuqorida bajarildi
-    # Log success
-    logger.info(f"Feedback received from {user_id}")
+    await message.answer(
+        get_text("feedback_thank_you_full", lang),
+        reply_markup=main_menu_keyboard(is_admin=is_admin, lang=lang),
+    )
+
 
 # ============================================================
 # Buyurtmalar (Orders)
@@ -7271,8 +7685,7 @@ async def admin_upload_guide_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.upload_video_guide)
     await callback.message.edit_text(get_text("send_video_guide_prompt", lang), reply_markup=back_to_admin_keyboard())
 
-@router.message(StateFilter(AdminStates.upload_video_guide), F.content_type == ContentType.VIDEO)
-# O'zgarish: ContentType.DOCUMENT ham qo'shildi, chunki Telegram ba'zan videolarni hujjat sifatida yuboradi.
+# VIDEO va DOCUMENT ikkalasi ham shu bitta handler orqali qabul qilinadi.
 @router.message(StateFilter(AdminStates.upload_video_guide), F.content_type.in_([ContentType.VIDEO, ContentType.DOCUMENT]))
 async def admin_upload_guide_process(message: Message, state: FSMContext):
     if not await is_user_admin(message.from_user.id): return
@@ -7776,12 +8189,16 @@ async def smart_send_video(
     try:
         # Userbot faqat storage kanaliga yuklaydi; foydalanuvchiga hech qachon
         # userbot akkauntidan to'g'ridan-to'g'ri yubormaymiz.
-        channel_msg = await user_bot.send_video(
-            chat_id=int(UPLOAD_CHANNEL_ID),
-            video=file_path,
-            width=width, height=height, duration=duration,
-            supports_streaming=True,
-            caption="Dono Bot storage",
+        logger.info("📤 Katta video storage kanaliga yuborilmoqda: %.2f MB", file_size / 1024 / 1024)
+        channel_msg = await asyncio.wait_for(
+            user_bot.send_video(
+                chat_id=UPLOAD_CHANNEL_ID,
+                video=file_path,
+                width=width, height=height, duration=duration,
+                supports_streaming=True,
+                caption="Dono Bot storage",
+            ),
+            timeout=900.0,
         )
         channel_message_id = int(channel_msg.id)
 
@@ -7953,7 +8370,6 @@ def language_selection_keyboard(lang: str, prefix: str):
     builder.add(InlineKeyboardButton(text=get_text("lang_ru", lang), callback_data=f"{prefix}_ru"))
     builder.add(InlineKeyboardButton(text=get_text("lang_uz", lang), callback_data=f"{prefix}_uz"))
     builder.row(InlineKeyboardButton(text=get_text("back_main", lang), callback_data="menu_main"))
-    builder.adjust(3, 1)
     builder.adjust(1)
     return builder.as_markup()
 
@@ -7980,7 +8396,7 @@ async def select_source_lang_handler(callback: CallbackQuery, state: FSMContext)
     await callback.message.edit_text(get_text("enter_text_for_translation", lang), reply_markup=cancel_keyboard(lang))
     await callback.answer()
 
-@router.message(StateFilter(TranslationStates.enter_text), F.text)
+@router.message(StateFilter(TranslationStates.enter_text))
 async def enter_text_for_translation_handler(message: Message, state: FSMContext):
     text_to_translate = (message.text or "").strip()
     if not text_to_translate:
@@ -7996,6 +8412,25 @@ async def enter_text_for_translation_handler(message: Message, state: FSMContext
         get_text("select_target_language", lang),
         reply_markup=language_selection_keyboard(lang, "translate_to")
     )
+
+def _translation_message_chunks(text: str, max_chars: int = 3800) -> list[str]:
+    """Telegram message limitidan oshirmasdan tarjima natijasini bo'ladi."""
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    while text:
+        cut = min(max_chars, len(text))
+        if cut < len(text):
+            boundary = text.rfind("\n", 0, cut)
+            if boundary < max_chars // 2:
+                boundary = text.rfind(" ", 0, cut)
+            if boundary > 0:
+                cut = boundary
+        chunks.append(text[:cut].strip())
+        text = text[cut:].lstrip()
+    return [chunk for chunk in chunks if chunk]
+
 
 @router.callback_query(StateFilter(TranslationStates.select_target_lang), F.data.startswith("translate_to_"))
 async def select_target_lang_handler(callback: CallbackQuery, state: FSMContext):
@@ -8014,16 +8449,29 @@ async def select_target_lang_handler(callback: CallbackQuery, state: FSMContext)
         await state.clear()
         return
 
+    if source_lang == target_lang:
+        await callback.message.edit_text(
+            f"<b>Tarjima:</b>\n\n{escape(text_to_translate)}",
+            parse_mode="HTML",
+            reply_markup=back_to_main_keyboard(lang),
+        )
+        await callback.answer("Manba va tarjima tili bir xil. ✅")
+        await state.clear()
+        return
+
     cache_key = hashlib.sha256(
         f"{source_lang}:{target_lang}:{text_to_translate}".encode("utf-8")
     ).hexdigest()
     cached = _TRANSLATION_CACHE.get(cache_key)
     if cached:
+        chunks = _translation_message_chunks(cached)
         await callback.message.edit_text(
-            f"<b>Tarjima:</b>\n\n{escape(cached)}",
+            f"<b>Tarjima:</b>\n\n{escape(chunks[0])}",
             parse_mode="HTML",
             reply_markup=back_to_main_keyboard(lang),
         )
+        for chunk in chunks[1:]:
+            await callback.message.answer(escape(chunk), parse_mode="HTML")
         await callback.answer()
         await state.clear()
         return
@@ -8042,11 +8490,14 @@ async def select_target_lang_handler(callback: CallbackQuery, state: FSMContext)
             for old_key in list(_TRANSLATION_CACHE)[:100]:
                 _TRANSLATION_CACHE.pop(old_key, None)
 
+        chunks = _translation_message_chunks(translated_text)
         await callback.message.edit_text(
-            f"<b>Tarjima:</b>\n\n{escape(translated_text)}",
+            f"<b>Tarjima:</b>\n\n{escape(chunks[0])}",
             parse_mode="HTML",
             reply_markup=back_to_main_keyboard(lang),
         )
+        for chunk in chunks[1:]:
+            await callback.message.answer(escape(chunk), parse_mode="HTML")
     except Exception as exc:
         logger.error("Tarjima xatosi: %s", exc, exc_info=True)
         await callback.message.edit_text(
@@ -8138,10 +8589,38 @@ async def start_userbot_with_retry() -> Any:
     return None
 
 
+# ============================================================
+# Render Web Service — PORT ni ochiq ushlab turish
+# ============================================================
+async def _render_health(request):
+    return web.Response(text="Dono Bot ishlayapti!", content_type="text/plain")
+
+
+async def start_web_server():
+    """Render portini 0.0.0.0 orqali ochadi."""
+    port = int(os.environ.get("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", _render_health)
+    app.router.add_get("/health", _render_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("🌐 Render web server %s-portda ishga tushdi.", port)
+    return runner
+
+
 async def main():
     # Userbot obyektini global o'zgaruvchiga o'rnatish (bot ishga tushganda)
     global user_bot, USERBOT_SESSION_NEEDS_RESET, UPLOAD_CHANNEL_ID
+
+    # Render portini ENG BIRINCHI ochamiz. Userbot yoki boshqa og'ir
+    # komponentlar ishga tushishida xato bo'lsa ham Render portni ko'radi.
+    web_runner = await start_web_server()
     
+    if not (PYROGRAM_AVAILABLE and API_ID and API_HASH):
+        logger.warning("⚠️ Katta fayllar uchun Pyrogram/API_ID/API_HASH sozlanmagan; native ID tanlash baribir ishlaydi.")
+
     if PYROGRAM_AVAILABLE and API_ID and API_HASH:
         if os.path.exists(userbot_session_journal_path):
             # Ko'pincha server qayta ishga tushganda journal qolib ketadi va sqlite lock beradi.
@@ -8191,16 +8670,39 @@ async def main():
     # Bot admin/member bo'lmasa copyMessage ishlamaydi; buni yuklash paytida emas,
     # start vaqtida aniqlash qotib qolish va noto'g'ri xabarlarni kamaytiradi.
     if UPLOAD_CHANNEL_ID:
+        raw_upload_channel = str(UPLOAD_CHANNEL_ID).strip()
         try:
+            # .env da -100... ID yoki @username ishlatish mumkin.
+            channel_ref = int(raw_upload_channel) if raw_upload_channel.lstrip("-").isdigit() else raw_upload_channel
+            chat = await bot.get_chat(channel_ref)
             me = await bot.get_me()
-            member = await bot.get_chat_member(int(UPLOAD_CHANNEL_ID), me.id)
-            if getattr(member, "status", None) not in {"administrator", "creator"}:
-                logger.error("UPLOAD_CHANNEL_ID kanalida bot admin emas: katta fayl oqimi o'chiriladi.")
+            member = await bot.get_chat_member(chat.id, me.id)
+            status = getattr(member, "status", None)
+            logger.info("Storage kanal topildi: title=%r id=%s status=%s", getattr(chat, "title", None), chat.id, status)
+            if status not in {"administrator", "creator"}:
+                logger.error(
+                    "❌ Storage kanalida bot admin emas. channel=%s status=%s. "
+                    "Botni kanalga ADMIN qilib qo‘ying.",
+                    chat.id, status,
+                )
                 UPLOAD_CHANNEL_ID = None
             else:
-                logger.info("✅ Storage kanalga Bot API kirishi tasdiqlandi.")
+                # Keyingi barcha copy/send amallari uchun canonical ID saqlanadi.
+                UPLOAD_CHANNEL_ID = str(chat.id)
+                logger.info("✅ Storage kanalga Bot API kirishi tasdiqlandi: %s", UPLOAD_CHANNEL_ID)
+        except TelegramBadRequest as exc:
+            logger.error(
+                "❌ Storage chat topilmadi: ref=%r. Telegram=%s. "
+                "Bu ID noto‘g‘ri bo‘lishi yoki BOT bu private kanal/guruhga qo‘shilmagan bo‘lishi mumkin. "
+                "ID aniqlash → Telegramdan tanlash orqali aniq -100... ID ni oling, so‘ng BOTNI o‘sha chatga ADMIN qiling.",
+                raw_upload_channel, exc, exc_info=True,
+            )
+            UPLOAD_CHANNEL_ID = None
         except Exception as exc:
-            logger.error("Storage kanal tekshiruvi muvaffaqiyatsiz: %s", exc)
+            logger.error(
+                "❌ Storage kanal tekshiruvi muvaffaqiyatsiz: ref=%r: %s",
+                raw_upload_channel, exc, exc_info=True,
+            )
             UPLOAD_CHANNEL_ID = None
 
     dp = Dispatcher(storage=storage)
@@ -8249,12 +8751,18 @@ async def main():
 
     logger.info("✅ Bot ishga tushdi!")
 
+    # Render Web Service portini polling bilan bir event-loopda ushlab turamiz.
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
     except Exception as e:
-        logger.error("Bot ishga tushishda xato: %s", e)
+        logger.error("Bot polling/ishga tushishda xato: %s", e, exc_info=True)
     finally:
+        if web_runner is not None:
+            try:
+                await web_runner.cleanup()
+            except Exception:
+                pass
         await bot.session.close()
         if user_bot:
             try:
