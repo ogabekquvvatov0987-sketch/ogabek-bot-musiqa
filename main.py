@@ -1,7 +1,50 @@
 # Kerakli kutubxonalarni import qilish
 import asyncio
 import os
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from aiohttp import web
+
+# Render portini ogʻir kutubxonalar import qilinishidan OLDIN bind qilamiz.
+# Bu ayniqsa 512 MB RAM xizmatida startup vaqtida "No open ports detected"
+# holatini kamaytiradi. Keyin asosiy aiohttp server ham shu portni egallamaydi.
+_render_early_server = None
+_render_early_port = None
+
+class _RenderHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"Dono Bot is alive!"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def log_message(self, format, *args):
+        return
+
+def _start_render_early_server():
+    global _render_early_server, _render_early_port
+    try:
+        port = int(os.environ.get("PORT", "10000"))
+        _render_early_server = ThreadingHTTPServer(("0.0.0.0", port), _RenderHealthHandler)
+        _render_early_port = port
+        thread = threading.Thread(
+            target=_render_early_server.serve_forever,
+            name="render-health",
+            daemon=True,
+        )
+        thread.start()
+    except Exception as exc:
+        # Asosiy aiohttp server keyin qayta urinadi.
+        _render_early_server = None
+        _render_early_port = None
+
+_start_render_early_server()
 import time
 import re
 import sqlite3
@@ -564,7 +607,7 @@ TRANSLATIONS = {
         "btn_create_profile": "➕ Profil yaratish",
         "btn_restore_profile": "🔄 Profilni tiklash",
         "privacy_notice": "🔒 <b>Hurmatli foydalanuvchi!</b>\n\nSizning profil ma'lumotlaringiz begonalarga ko'rsatilmaydi. Maxfiylik va xavfsizlik to'liq ta'minlanadi. ✅",
-        "about_text": "🤖 <b>Dono Bot — universal yordamchingiz!</b>\n\n📥 <b>Media:</b> YouTube, Instagram va Facebook'dan media yuklash.\n🎵 <b>Musiqa:</b> Musiqa qidirish, videodan audio ajratish va Shazam orqali aniqlash.\n🗣 <b>Ovoz:</b> Matn → ovoz va ovozli xabar → matn.\n🖼 <b>Rasm:</b> Fonni olib tashlash va oq-qora filtr.\n📢 <b>Reklama:</b> Reklama buyurtmasini yuborish va boshqarish.\n💾 <b>Saqlanganlar:</b> Mening musiqalarim, videolarim va rasmlarim.\n🆘 <b>Qo'llab-quvvatlash:</b> Admin bilan jonli chat, yakunda baho va fikr qoldirish.\n🔄 <b>Tarjima:</b> O'zbek, rus va ingliz tillari o'rtasida tarjima.\n🆔 <b>ID aniqlash:</b> Telegramning o'z chat tanlash oynasidan kanal yoki guruhni xavfsiz tanlash.\n\n🔐 <b>Maxfiylik:</b> Profil ma'lumotlari faqat reklama xizmati bilan bog'liq xizmatlarni ko'rsatish uchun ishlatiladi.\n🛡 <b>Xavfsizlik:</b> Bot faqat kerakli xizmatlarni bajarish uchun ma'lumotlardan foydalanadi; maxfiy kodlar, parollar va Telegram sessiyasi foydalanuvchidan so'ralmaydi.\n\n⚠️ <b>Eslatma:</b> Tashqi platformalarning (YouTube, Instagram va boshqalar) o'z cheklovlari bo'lishi mumkin.",
+        "about_text": "🤖 <b>Dono Bot — universal yordamchingiz!</b>\n\n📥 <b>Media:</b> YouTube, Instagram va Facebook'dan media yuklash.\n🎵 <b>Musiqa:</b> Musiqa qidirish, videodan audio ajratish va Shazam orqali aniqlash.\n🗣 <b>Ovoz:</b> Matn → ovoz va ovozli xabar → matn.\n🖼 <b>Rasm:</b> Fonni olib tashlash va oq-qora filtr.\n📢 <b>Reklama:</b> Reklama buyurtmasini yuborish va boshqarish.\n💾 <b>Saqlanganlar:</b> Mening musiqalarim, videolarim va rasmlarim.\n🆘 <b>Qo'llab-quvvatlash:</b> Admin bilan jonli chat, yakunda baho va fikr qoldirish.\n🔄 <b>Tarjima:</b> O'zbek, rus va ingliz tillari o'rtasida tarjima.\n🆔 <b>ID aniqlash:</b> @username, t.me havolasi, ID yoki kanal/guruh xabarini Forward qilish orqali aniqlash.\n\n🔐 <b>Maxfiylik:</b> Profil ma'lumotlari faqat reklama xizmati bilan bog'liq xizmatlarni ko'rsatish uchun ishlatiladi.\n🛡 <b>Xavfsizlik:</b> Bot faqat kerakli xizmatlarni bajarish uchun ma'lumotlardan foydalanadi; maxfiy kodlar, parollar va Telegram sessiyasi foydalanuvchidan so'ralmaydi.\n\n⚠️ <b>Eslatma:</b> Tashqi platformalarning (YouTube, Instagram va boshqalar) o'z cheklovlari bo'lishi mumkin.",
         "error": "⚠️ Xatolik yuz berdi.",
         "msg_wait_admin": "Xabaringiz adminga yuborildi, javobni kuting. ⏳",
         "rate_bot": "Iltimos, botni baholang (1-5): ⭐",
@@ -1518,7 +1561,14 @@ def get_text(key: str, lang: str = 'uz', **kwargs) -> str:
             text = uz_dict.get(key, key)
 
         try:
-            return text.format(**kwargs) if kwargs else text
+            # get_text() ko‘p joyda parse_mode="HTML" bilan yuboriladi.
+            # Dinamik qiymatlarda &, <, > kabi belgilar Telegram HTML parserini
+            # buzmasligi uchun placeholder qiymatlarini avtomatik escape qilamiz.
+            safe_kwargs = {
+                key_: escape(str(value)) if value is not None else ""
+                for key_, value in kwargs.items()
+            }
+            return text.format(**safe_kwargs) if kwargs else text
         except (KeyError, ValueError):
             return text
 
@@ -3126,7 +3176,7 @@ async def video_to_mp3_process(message: Message, state: FSMContext):
             save_kb_builder.add(InlineKeyboardButton(text=get_text("back_main", lang), callback_data="menu_main"))
             save_kb_builder.adjust(1)
 
-            await message.answer_audio(audio_file, caption=f"🎵 <b>{title}</b>\n\n{get_text('converted_via_bot', lang, bot_username=(await message.bot.get_me()).username)}", parse_mode="HTML", reply_markup=save_kb_builder.as_markup())
+            await message.answer_audio(audio_file, caption=f"🎵 <b>{escape(str(title))}</b>\n\n{get_text('converted_via_bot', lang, bot_username=(await message.bot.get_me()).username)}", parse_mode="HTML", reply_markup=save_kb_builder.as_markup())
             await status_msg.delete()
             await db.add_download_stat(user_id, "video_to_mp3")
         else:
@@ -8597,8 +8647,15 @@ async def _render_health(request):
 
 
 async def start_web_server():
-    """Render portini 0.0.0.0 orqali ochadi."""
+    """Render health serverini ishga tushiradi. Port oldindan bind qilingan bo‘lsa, qayta bind qilmaydi."""
     port = int(os.environ.get("PORT", "10000"))
+
+    # Startupning eng boshida ochilgan lightweight HTTP server Render portini allaqachon
+    # ko‘rib turadi. Uni aiohttp bilan ikkinchi marta bind qilish shart emas.
+    if _render_early_server is not None and _render_early_port == port:
+        logger.info("🌐 Render health server %s-portda oldindan ochilgan.", port)
+        return None
+
     app = web.Application()
     app.router.add_get("/", _render_health)
     app.router.add_get("/health", _render_health)
@@ -8606,7 +8663,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info("🌐 Render web server %s-portda ishga tushdi.", port)
+    logger.info("🌐 Render aiohttp web server %s-portda ishga tushdi.", port)
     return runner
 
 
